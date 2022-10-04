@@ -32,7 +32,7 @@ from . import (
     SequentialSampler,
     RandomSampler,
     BatchSampler,
-    Dataset,)
+    Dataset, )
 
 from torch.utils.data.datapipes.datapipe import _IterDataPipeSerializationWrapper, _MapDataPipeSerializationWrapper
 
@@ -54,7 +54,6 @@ _worker_init_fn_t = Callable[[int], None]
 # See https://github.com/python/mypy/issues/3737.
 _collate_fn_t = Callable[[List[T]], Any]
 
-
 # These functions used to be defined in this file. However, it was moved to
 # _utils/collate.py. Although it is rather hard to access this from user land
 # (one has to explicitly directly `import torch.utils.data.dataloader`), there
@@ -71,11 +70,15 @@ logger = logging.getLogger(__name__)
 class _DatasetKind(object):
     Map = 0
     Iterable = 1
+    Async = 2
 
     @staticmethod
-    def create_fetcher(kind, dataset, auto_collation, collate_fn, drop_last):
+    def create_fetcher(kind, dataset, auto_collation, collate_fn, drop_last, num_fetch_workers):
         if kind == _DatasetKind.Map:
             return _utils.fetch._MapDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
+        elif kind == _DatasetKind.Async:
+            return _utils.fetch._AsyncMapDatasetFetcher(dataset, auto_collation, collate_fn, drop_last,
+                                                        num_fetch_workers)
         else:
             return _utils.fetch._IterableDatasetFetcher(dataset, auto_collation, collate_fn, drop_last)
 
@@ -215,8 +218,9 @@ class DataLoader(Generic[T_co]):
     sampler: Union[Sampler, Iterable]
     pin_memory_device: str
     prefetch_factor: int
-    _iterator : Optional['_BaseDataLoaderIter']
+    _iterator: Optional['_BaseDataLoaderIter']
     __initialized = False
+    num_fetch_workers: Optional[int]
 
     def __init__(self, dataset: Dataset[T_co], batch_size: Optional[int] = 1,
                  shuffle: Optional[bool] = None, sampler: Union[Sampler, Iterable, None] = None,
@@ -227,7 +231,9 @@ class DataLoader(Generic[T_co]):
                  multiprocessing_context=None, generator=None,
                  *, prefetch_factor: int = 2,
                  persistent_workers: bool = False,
-                 pin_memory_device: str = ""):
+                 pin_memory_device: str = "",
+                 num_fetch_workers: int = 0,
+                 ):
         torch._C._log_api_usage_once("python.data_loader")
 
         if num_workers < 0:
@@ -247,6 +253,7 @@ class DataLoader(Generic[T_co]):
 
         self.dataset = dataset
         self.num_workers = num_workers
+        self.num_workers = num_fetch_workers
         self.prefetch_factor = prefetch_factor
         self.pin_memory = pin_memory
         self.pin_memory_device = pin_memory_device
@@ -314,8 +321,6 @@ class DataLoader(Generic[T_co]):
         else:
             shuffle = bool(shuffle)
             self._dataset_kind = _DatasetKind.Map
-
-
 
         if sampler is not None and shuffle:
             raise ValueError('sampler option is mutually exclusive with '
@@ -396,7 +401,8 @@ class DataLoader(Generic[T_co]):
                              'should specify a valid start method in {!r}, but got '
                              'multiprocessing_context={!r}').format(valid_start_methods, multiprocessing_context))
                     # error: Argument 1 to "get_context" has incompatible type "Union[str, bytes]"; expected "str"  [arg-type]
-                    multiprocessing_context = multiprocessing.get_context(multiprocessing_context)  # type: ignore[arg-type]
+                    multiprocessing_context = multiprocessing.get_context(
+                        multiprocessing_context)  # type: ignore[arg-type]
 
                 if not isinstance(multiprocessing_context, python_multiprocessing.context.BaseContext):
                     raise TypeError(('multiprocessing_context option should be a valid context '
@@ -511,8 +517,8 @@ class DataLoader(Generic[T_co]):
             suggested_max_worker_msg = ((
                 "Our suggested max number of worker in current system is {}{}, which is smaller "
                 "than what this DataLoader is going to create.").format(
-                    num_worker_suggest,
-                    ("" if cpuset_checked else " (`cpuset` is not taken into account)"))
+                num_worker_suggest,
+                ("" if cpuset_checked else " (`cpuset` is not taken into account)"))
             ) if num_worker_suggest is not None else (
                 "DataLoader is not able to compute a suggested max number of worker in current system.")
 
@@ -520,8 +526,8 @@ class DataLoader(Generic[T_co]):
                 "This DataLoader will create {} worker processes in total. {} "
                 "Please be aware that excessive worker creation might get DataLoader running slow or even freeze, "
                 "lower the worker number to avoid potential slowness/freeze if necessary.").format(
-                    num_worker_created,
-                    suggested_max_worker_msg)
+                num_worker_created,
+                suggested_max_worker_msg)
             return warn_msg
 
         if not self.num_workers or self.num_workers == 0:
@@ -575,6 +581,7 @@ class _BaseDataLoaderIter(object):
         self._drop_last = loader.drop_last
         self._index_sampler = loader._index_sampler
         self._num_workers = loader.num_workers
+        self.num_fetch_workers = loader.num_fetch_workers
         ws, rank = _get_distributed_settings()
         self._world_size = ws
         self._rank = rank
@@ -587,8 +594,9 @@ class _BaseDataLoaderIter(object):
             self._pin_memory_device = None
         else:
             if not loader.pin_memory:
-                warn_msg = ("pin memory device is set and pin_memory flag is not used then device pinned memory won't be used"
-                            "please set pin_memory to true, if you need to use the device pin memory")
+                warn_msg = (
+                    "pin memory device is set and pin_memory flag is not used then device pinned memory won't be used"
+                    "please set pin_memory to true, if you need to use the device pin memory")
                 warnings.warn(warn_msg)
 
             self._pin_memory = loader.pin_memory
@@ -630,13 +638,15 @@ class _BaseDataLoaderIter(object):
             if self._dataset_kind == _DatasetKind.Iterable and \
                     self._IterableDataset_len_called is not None and \
                     self._num_yielded > self._IterableDataset_len_called:
-                warn_msg = ("Length of IterableDataset {} was reported to be {} (when accessing len(dataloader)), but {} "
-                            "samples have been fetched. ").format(self._dataset, self._IterableDataset_len_called,
-                                                                  self._num_yielded)
+                warn_msg = (
+                    "Length of IterableDataset {} was reported to be {} (when accessing len(dataloader)), but {} "
+                    "samples have been fetched. ").format(self._dataset, self._IterableDataset_len_called,
+                                                          self._num_yielded)
                 if self._num_workers > 0:
-                    warn_msg += ("For multiprocessing data-loading, this could be caused by not properly configuring the "
-                                 "IterableDataset replica at each worker. Please see "
-                                 "https://pytorch.org/docs/stable/data.html#torch.utils.data.IterableDataset for examples.")
+                    warn_msg += (
+                        "For multiprocessing data-loading, this could be caused by not properly configuring the "
+                        "IterableDataset replica at each worker. Please see "
+                        "https://pytorch.org/docs/stable/data.html#torch.utils.data.IterableDataset for examples.")
                 warnings.warn(warn_msg)
             return data
 
@@ -664,7 +674,8 @@ class _SingleProcessDataLoaderIter(_BaseDataLoaderIter):
             torch.utils.data.graph_settings.apply_sharding(self._dataset, self._world_size, self._rank)
 
         self._dataset_fetcher = _DatasetKind.create_fetcher(
-            self._dataset_kind, self._dataset, self._auto_collation, self._collate_fn, self._drop_last)
+            self._dataset_kind, self._dataset, self._auto_collation, self._collate_fn, self._drop_last,
+            self.num_fetch_workers)
 
     def _next_data(self):
         index = self._next_index()  # may raise StopIteration
@@ -1153,102 +1164,102 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
                         " at the beginning of your code") from None
             raise
 
-# NOTE [ DataLoader on Linux and open files limit ]
-#
-# On Linux when DataLoader is used with multiprocessing we pass the data between
-# the root process and the workers through SHM files. We remove those files from
-# the filesystem as soon as they are created and keep them alive by
-# passing around their file descriptors through AF_UNIX sockets. (See
-# docs/source/multiprocessing.rst and 'Multiprocessing Technical Notes` in
-# the wiki (https://github.com/pytorch/pytorch/wiki).)
-#
-# This sometimes leads us to exceeding the open files limit. When that happens,
-# and the offending file descriptor is coming over a socket, the `socket` Python
-# package silently strips the file descriptor from the message, setting only the
-# `MSG_CTRUNC` flag (which might be a bit misleading since the manpage says that
-# it _indicates that some control data were discarded due to lack of space in
-# the buffer for ancillary data_). This might reflect the C implementation of
-# AF_UNIX sockets.
-#
-# This behaviour can be reproduced with the script and instructions at the
-# bottom of this note.
-#
-# When that happens, the standard Python `multiprocessing` (and not
-# `torch.multiprocessing`) raises a `RuntimeError: received 0 items of ancdata`
-#
-# Sometimes, instead of the FD being stripped, you may get an `OSError:
-# Too many open files`, both in the script below and in DataLoader. However,
-# this is rare and seems to be nondeterministic.
-#
-#
-#   #!/usr/bin/env python3
-#   import sys
-#   import socket
-#   import os
-#   import array
-#   import shutil
-#   import socket
-#
-#
-#   if len(sys.argv) != 4:
-#       print("Usage: ", sys.argv[0], " tmp_dirname iteration (send|recv)")
-#       sys.exit(1)
-#
-#   if __name__ == '__main__':
-#       dirname = sys.argv[1]
-#       sock_path = dirname + "/sock"
-#       iterations = int(sys.argv[2])
-#       def dummy_path(i):
-#           return dirname + "/" + str(i) + ".dummy"
-#
-#
-#       if sys.argv[3] == 'send':
-#           while not os.path.exists(sock_path):
-#               pass
-#           client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-#           client.connect(sock_path)
-#           for i in range(iterations):
-#               fd = os.open(dummy_path(i), os.O_WRONLY | os.O_CREAT)
-#               ancdata = array.array('i', [fd])
-#               msg = bytes([i % 256])
-#               print("Sending fd ", fd, " (iteration #", i, ")")
-#               client.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, ancdata)])
-#
-#
-#       else:
-#           assert sys.argv[3] == 'recv'
-#
-#           if os.path.exists(dirname):
-#               raise Exception("Directory exists")
-#
-#           os.mkdir(dirname)
-#
-#           print("Opening socket...")
-#           server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-#           server.bind(sock_path)
-#
-#           print("Listening...")
-#           for i in range(iterations):
-#               a = array.array('i')
-#               msg, ancdata, flags, addr = server.recvmsg(1, socket.CMSG_SPACE(a.itemsize))
-#               assert(len(ancdata) == 1)
-#               cmsg_level, cmsg_type, cmsg_data = ancdata[0]
-#               a.frombytes(cmsg_data)
-#               print("Received fd ", a[0], " (iteration #", i, ")")
-#
-#           shutil.rmtree(dirname)
-#
-# Steps to reproduce:
-#
-# 1. Run two shells and set lower file descriptor limit in the receiving one:
-# (shell1) ulimit -n 1020
-# (shell2) ulimit -n 1022
-#
-# 2. Run the script above with the `recv` option in the first shell
-# (shell1) ./test_socket.py sock_tmp 1017 recv
-#
-# 3. Run the script with the `send` option in the second shell:
-# (shell2) ./test_socket.py sock_tmp 1017 send
+    # NOTE [ DataLoader on Linux and open files limit ]
+    #
+    # On Linux when DataLoader is used with multiprocessing we pass the data between
+    # the root process and the workers through SHM files. We remove those files from
+    # the filesystem as soon as they are created and keep them alive by
+    # passing around their file descriptors through AF_UNIX sockets. (See
+    # docs/source/multiprocessing.rst and 'Multiprocessing Technical Notes` in
+    # the wiki (https://github.com/pytorch/pytorch/wiki).)
+    #
+    # This sometimes leads us to exceeding the open files limit. When that happens,
+    # and the offending file descriptor is coming over a socket, the `socket` Python
+    # package silently strips the file descriptor from the message, setting only the
+    # `MSG_CTRUNC` flag (which might be a bit misleading since the manpage says that
+    # it _indicates that some control data were discarded due to lack of space in
+    # the buffer for ancillary data_). This might reflect the C implementation of
+    # AF_UNIX sockets.
+    #
+    # This behaviour can be reproduced with the script and instructions at the
+    # bottom of this note.
+    #
+    # When that happens, the standard Python `multiprocessing` (and not
+    # `torch.multiprocessing`) raises a `RuntimeError: received 0 items of ancdata`
+    #
+    # Sometimes, instead of the FD being stripped, you may get an `OSError:
+    # Too many open files`, both in the script below and in DataLoader. However,
+    # this is rare and seems to be nondeterministic.
+    #
+    #
+    #   #!/usr/bin/env python3
+    #   import sys
+    #   import socket
+    #   import os
+    #   import array
+    #   import shutil
+    #   import socket
+    #
+    #
+    #   if len(sys.argv) != 4:
+    #       print("Usage: ", sys.argv[0], " tmp_dirname iteration (send|recv)")
+    #       sys.exit(1)
+    #
+    #   if __name__ == '__main__':
+    #       dirname = sys.argv[1]
+    #       sock_path = dirname + "/sock"
+    #       iterations = int(sys.argv[2])
+    #       def dummy_path(i):
+    #           return dirname + "/" + str(i) + ".dummy"
+    #
+    #
+    #       if sys.argv[3] == 'send':
+    #           while not os.path.exists(sock_path):
+    #               pass
+    #           client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    #           client.connect(sock_path)
+    #           for i in range(iterations):
+    #               fd = os.open(dummy_path(i), os.O_WRONLY | os.O_CREAT)
+    #               ancdata = array.array('i', [fd])
+    #               msg = bytes([i % 256])
+    #               print("Sending fd ", fd, " (iteration #", i, ")")
+    #               client.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, ancdata)])
+    #
+    #
+    #       else:
+    #           assert sys.argv[3] == 'recv'
+    #
+    #           if os.path.exists(dirname):
+    #               raise Exception("Directory exists")
+    #
+    #           os.mkdir(dirname)
+    #
+    #           print("Opening socket...")
+    #           server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    #           server.bind(sock_path)
+    #
+    #           print("Listening...")
+    #           for i in range(iterations):
+    #               a = array.array('i')
+    #               msg, ancdata, flags, addr = server.recvmsg(1, socket.CMSG_SPACE(a.itemsize))
+    #               assert(len(ancdata) == 1)
+    #               cmsg_level, cmsg_type, cmsg_data = ancdata[0]
+    #               a.frombytes(cmsg_data)
+    #               print("Received fd ", a[0], " (iteration #", i, ")")
+    #
+    #           shutil.rmtree(dirname)
+    #
+    # Steps to reproduce:
+    #
+    # 1. Run two shells and set lower file descriptor limit in the receiving one:
+    # (shell1) ulimit -n 1020
+    # (shell2) ulimit -n 1022
+    #
+    # 2. Run the script above with the `recv` option in the first shell
+    # (shell1) ./test_socket.py sock_tmp 1017 recv
+    #
+    # 3. Run the script with the `send` option in the second shell:
+    # (shell2) ./test_socket.py sock_tmp 1017 send
 
     def _get_data(self):
         # Fetches data from `self._data_queue`.
