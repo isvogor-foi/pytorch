@@ -273,7 +273,10 @@ class DataLoader(Generic[T_co]):
         # samplers first, so that they don't learn that this combo doesn't work
         # after spending time fixing the custom sampler errors.
         if isinstance(dataset, IterableDataset):
-            self._dataset_kind = _DatasetKind.Iterable
+            if self.num_fetch_workers > 0:
+                self._dataset_kind = _DatasetKind.Async
+            else:
+                self._dataset_kind = _DatasetKind.Iterable
             # NOTE [ Custom Samplers and IterableDataset ]
             #
             # `IterableDataset` does not support custom `batch_sampler` or
@@ -341,7 +344,7 @@ class DataLoader(Generic[T_co]):
                                  'and is mutually exclusive with drop_last')
 
         if sampler is None:  # give default samplers
-            if self._dataset_kind == _DatasetKind.Iterable:
+            if self._dataset_kind == _DatasetKind.Iterable or self._dataset_kind == _DatasetKind.Async:
                 # See NOTE [ Custom Samplers and IterableDataset ]
                 sampler = _InfiniteConstantSampler()
             else:  # map-style
